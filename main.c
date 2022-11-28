@@ -17,11 +17,11 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <Shobjidl.h>
+#define SDL_MAIN_HANDLED
+#include <SDL.h>
+#include <SDL_syswm.h>
 
-#include "cppjunk.h"
+// #include "cppjunk.h"
 #include "pcg_basic.h"
 
 #define ARRSIZE(ARRAY_) (sizeof(ARRAY_)/sizeof((ARRAY_)[0]))
@@ -32,18 +32,11 @@ int G_TIMESTEPS;
 int G_WIDTH;
 int G_HEIGHT;
 int G_POINTS;
-int G_THREADS;
 
-typedef struct {
-	float px, py;
-	float vx, vy;
-	float ax, ay;
-	uint32_t color;
-} Point;
+float G_DT; // "delta tee"
 
-typedef struct {
-	uint8_t r, g, b, a;
-} Color;
+SDL_Window *G_Window;
+SDL_Renderer *G_Renderer;
 
 typedef union {
 	struct {
@@ -52,15 +45,14 @@ typedef union {
 	uint32_t color;
 } Pixel;
 
+typedef Pixel Color;
+
 typedef struct {
-	int row;
-	int rows;
-	Pixel *pixels;
-	Point *points;
-	int *run;
-	int *timestep;
-	int *finished;
-} ThreadData;
+	float px, py;
+	float vx, vy;
+	float ax, ay;
+	Color color;
+} Point;
 
 Color G_SkewColor = { 0xff, 0x00, 0x00, 0xff };
 
@@ -86,27 +78,21 @@ float RandomFloat(float max)
 }
 
 // GetRandomColor: returns a random color, pass a color to mix with the input color, or NULL to not
-uint32_t GetRandomColor(Color *in)
+Color GetRandomColor(Color *in)
 {
-	uint32_t color = 0;
+	Color color = { 0 };
 
-	uint8_t red = RandBound(256);
-	uint8_t green = RandBound(256);
-	uint8_t blue = RandBound(256);
+	color.r = RandBound(256);
+	color.g = RandBound(256);
+	color.b = RandBound(256);
 
 	if (in != NULL) {
-		red = (red + in->r) / 2;
-		green = (green + in->g) / 2;
-		blue = (blue + in->b) / 2;
+		color.r = (color.r + in->r) / 2;
+		color.g = (color.g + in->g) / 2;
+		color.b = (color.b + in->b) / 2;
 	}
 
-	color |= 0xff;
-	color <<= 8;
-	color |= blue;
-	color <<= 8;
-	color |= green;
-	color <<= 8;
-	color |= red;
+	color.a = 0xff;
 
 	return color;
 }
@@ -116,8 +102,8 @@ void GenerateRandomPoint(Point *p)
 {
 	p->px = RandomFloat(G_WIDTH);
 	p->py = RandomFloat(G_HEIGHT);
-	p->vx = RandomFloat(5) - 10.0f;
-	p->vy = RandomFloat(5) - 10.0f;
+	p->vx = RandomFloat(30) - 60.0f;
+	p->vy = RandomFloat(30) - 60.0f;
 	// p->ax = RandomFloat(1) - 2.0f;
 	// p->ay = RandomFloat(1) - 2.0f;
 	p->color = GetRandomColor(&G_SkewColor);
@@ -156,8 +142,7 @@ void UpdatePixelForPoints(Pixel *pixel, int x, int y, Point *points, size_t poin
 	}
 
 	assert(picked != NULL);
-
-	pixel->color = picked->color;
+	*pixel = picked->color;
 }
 
 // DrawPoint: draws a colored dot at the point (x, y)
@@ -165,9 +150,9 @@ void DrawPoint(Pixel *pixels, int x, int y)
 {
 	for (int i = -2; i <= 2; i++) {
 		for (int j = -2; j <= 2; j++) {
-			if (x + i < 0 || x + i > G_WIDTH)
+			if (x + i < 0 || x + i >= G_WIDTH)
 				continue;
-			if (y + j < 0 || y + j > G_WIDTH)
+			if (y + j < 0 || y + j >= G_HEIGHT)
 				continue;
 			pixels[(x + i) + G_WIDTH * (y + j)].g = 0xff;
 		}
@@ -188,41 +173,12 @@ void MovePoint(Point *point)
 		point->vx *= -1.0f;
 	}
 
-	point->vx += point->ax;
-	point->vy += point->ay;
+	point->vx += G_DT * point->ax;
+	point->vy += G_DT * point->ay;
 
-	point->px += point->vx;
-	point->py += point->vy;
+	point->px += G_DT * point->vx;
+	point->py += G_DT * point->vy;
 #undef OOB
-}
-
-DWORD MultiPaintThreadProc(LPVOID param)
-{
-	ThreadData *data = param;
-
-	Pixel *pixels = data->pixels;
-	Point *points = data->points;
-
-	int timestep = 0;
-
-	for (;;) {
-		BOOL wait = WaitOnAddress(data->timestep, &timestep, sizeof(*data->timestep), INFINITE);
-		if (wait == FALSE) {
-			if (data->run)
-				continue;
-			break;
-		}
-
-		for (int y = data->row; y < data->row + data->rows; y++) {
-			for (int x = 0; x < G_WIDTH; x++) {
-				UpdatePixelForPoints(pixels + (x + G_WIDTH * y), x, y, points, G_POINTS);
-			}
-		}
-
-		InterlockedIncrement((LONG*)data->finished);
-	}
-
-	return 0;
 }
 
 void PrintPoint(Point *point, int idx)
@@ -236,29 +192,84 @@ void PrintPoint(Point *point, int idx)
 	printf("  AY %3.4f\n", point->ay);
 }
 
-int UpdateWallpaper(char *file)
+bool MakeWindowTransparent()
 {
-	int rc;
-	char fname[1024] = { 0 };
+	SDL_SysWMinfo wminfo;
+	SDL_VERSION(&wminfo.version);
+	SDL_GetWindowWMInfo(G_Window, &wminfo);
+	HWND hwnd = wminfo.info.win.window;
 
-	memset(fname, 0, sizeof fname);
+	SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED);
 
-	size_t len = GetFullPathNameA(file, sizeof fname, fname, NULL);
-	assert(len <= sizeof fname);
-
-	rc = SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, fname, SPIF_UPDATEINIFILE|SPIF_SENDWININICHANGE);
-	return rc ? 0 : -1;
+	return SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0xff, LWA_ALPHA);
 }
 
-void SingleThreaded(Pixel *pixels, Point *points)
+int main(int argc, char **argv)
 {
 	int rc;
 
-	char image_name[256] = { 0 };
-	snprintf(image_name, sizeof image_name, "%s.bmp", TEMPLATE_NAME);
+	// TODO (Brian) Get the screen resolution by calling Windows
+	G_WIDTH = 1920;
+	G_HEIGHT = 1080;
+	G_TIMESTEPS = INT_MAX; // :)
 
-	for (int t = 0; t < G_TIMESTEPS; t++) {
-		printf("\rTimestep %d", t);
+	SeedRNG();
+
+	G_POINTS = RandBound(7) + 5;
+
+	Pixel *pixels = (Pixel *)calloc(G_WIDTH * G_HEIGHT, sizeof(*pixels));
+	Point *points = (Point *)calloc(G_POINTS, sizeof(*points));
+
+	for (int i = 0; i < G_POINTS; i++)
+		GenerateRandomPoint(points + i);
+
+	uint32_t flags = SDL_WINDOW_OPENGL|SDL_WINDOW_SHOWN|SDL_WINDOW_ALWAYS_ON_TOP|SDL_WINDOW_BORDERLESS;
+
+	if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
+		fprintf(stderr, "Couldn't initialize SDL: %s\n", SDL_GetError());
+		return 1;
+	}
+
+	rc = SDL_CreateWindowAndRenderer(G_WIDTH, G_HEIGHT, flags, &G_Window, &G_Renderer);
+	if (rc < 0) {
+		fprintf(stderr, "Couldn't Create Window or Renderer: %s\n", SDL_GetError());
+		return 1;
+	}
+
+	SDL_SetWindowTitle(G_Window, "SDL Test");
+
+	rc = SDL_SetRenderDrawBlendMode(G_Renderer, SDL_BLENDMODE_BLEND);
+	if (rc < 0) {
+		fprintf(stderr, "Couldn't set render blend mode: %s\n", SDL_GetError());
+		return 1;
+	}
+
+	SDL_Event event;
+
+	SDL_Texture *texture = SDL_CreateTexture(G_Renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, G_WIDTH, G_HEIGHT);
+
+	uint32_t tstart, tend;
+	int run = true;
+
+	for (int t = 0; run && t < G_TIMESTEPS; t++) {
+		tstart = SDL_GetTicks();
+
+		while (SDL_PollEvent(&event) != 0) {
+			switch (event.type) {
+				case SDL_QUIT:
+					run = false;
+					break;
+
+				case SDL_KEYDOWN:
+				case SDL_KEYUP:
+					if (event.key.keysym.scancode == SDL_SCANCODE_Q)
+						run = false;
+					break;
+
+				default:
+					break;
+			}
+		}
 
 		for (int x = 0; x < G_WIDTH; x++) {
 			for (int y = 0; y < G_HEIGHT; y++) {
@@ -270,124 +281,30 @@ void SingleThreaded(Pixel *pixels, Point *points)
 			DrawPoint(pixels, points[i].px, points[i].py);
 		}
 
-		rc = stbi_write_bmp(image_name, G_WIDTH, G_HEIGHT, 4, (void *)pixels);
-		if (rc == 0) {
-			fprintf(stderr, "There was an error writing the file!");
-			exit(1);
-		}
+		SDL_UpdateTexture(texture, NULL, pixels, G_WIDTH * 4);
 
-		rc = UpdateWallpaper(image_name);
-		if (rc < 0) {
-			fprintf(stderr, "Could not set wallpaper...\n");
-			break;
-		}
+		SDL_SetRenderDrawColor(G_Renderer, 0, 0, 0, 0xff);
+		SDL_RenderClear(G_Renderer);
 
-		for (int i = 0; i < G_POINTS; i++) {
-			MovePoint(points + i);
-		}
-	}
-}
+		SDL_RenderCopy(G_Renderer, texture, NULL, NULL);
 
-void MultiThreaded(Pixel *pixels, Point *points)
-{
-	int run, timestep, finished, rc;
+		MakeWindowTransparent();
 
-	G_THREADS = 20;
+		SDL_RenderPresent(G_Renderer);
 
-	char image_name[256] = { 0 };
-	snprintf(image_name, sizeof image_name, "%s.bmp", TEMPLATE_NAME);
+		tend = SDL_GetTicks();
 
-	HANDLE *threads = calloc(G_THREADS, sizeof(*threads));
-	ThreadData *thread_data = calloc(G_THREADS, sizeof(*thread_data));
-
-	{
-		// NOTE (Brian) the threading model for this threading based attempt at speed is to delegate
-		// a number of rows for the particular thread to complete. Because of this decision, it is
-		// very important to choose a number that will EVENLY divide the vertical space, otherwise
-		// we'll end up with un-updated rows (probably black in output??).
-
-		for (int i = 0; i < G_THREADS; i++) {
-			thread_data[i].row = i * (G_HEIGHT / G_THREADS);
-			thread_data[i].rows = (G_HEIGHT / G_THREADS);
-			thread_data[i].pixels = pixels;
-			thread_data[i].points = points;
-			thread_data[i].run = &run;
-			thread_data[i].timestep = &timestep;
-			thread_data[i].finished = &finished;
-		}
-
-		for (int i = 0; i < G_THREADS; i++) {
-			threads[i] = CreateThread(NULL, 0, MultiPaintThreadProc, thread_data + i, 0, NULL);
-			assert(threads[i] != NULL);
-		}
-	}
-
-	run = true;
-
-	for (int t = 0; t < G_TIMESTEPS; t++) {
-		printf("\rTimestep %d", t);
-
-		InterlockedExchange((LONG *)&finished, 0);
-		InterlockedIncrement((LONG *)&timestep);
-
-		while (InterlockedCompareExchange((LONG *)&finished, G_THREADS, 0) != G_THREADS)
-			;
-
-		for (int i = 0; i < G_POINTS; i++) {
-			DrawPoint(pixels, points[i].px, points[i].py);
-		}
-
-		rc = stbi_write_bmp(image_name, G_WIDTH, G_HEIGHT, 4, (void *)pixels);
-		if (rc == 0) {
-			fprintf(stderr, "There was an error writing the file!");
-			exit(1);
-		}
-
-		rc = UpdateWallpaper(image_name);
-		if (rc < 0) {
-			fprintf(stderr, "Could not set wallpaper...\n");
-			break;
-		}
+		G_DT = ((float)tend - tstart) / 1000.0f;
 
 		for (int i = 0; i < G_POINTS; i++) {
 			MovePoint(points + i);
 		}
 	}
 
-	run = false;
-	InterlockedIncrement((LONG *)&timestep);
+	SDL_DestroyRenderer(G_Renderer);
+	SDL_DestroyWindow(G_Window);
 
-	for (int i = 0; i < G_THREADS; i++)
-		WaitForSingleObject(threads[i], INFINITE);
-
-	free(thread_data);
-}
-
-int main(int argc, char **argv)
-{
-	int rc;
-
-	// TODO (Brian) Get the screen resolution by calling Windows
-	G_WIDTH = 1280;
-	G_HEIGHT = 720;
-	G_TIMESTEPS = 1000; // :)
-
-	SeedRNG();
-
-	// G_POINTS = RandBound(14) + 5;
-	G_POINTS = 6;
-
-	Pixel *pixels = (Pixel *)calloc(G_WIDTH * G_HEIGHT, sizeof(*pixels));
-	Point *points = (Point *)calloc(G_POINTS, sizeof(*points));
-
-	for (int i = 0; i < G_POINTS; i++)
-		GenerateRandomPoint(points + i);
-
-#if 0
-	SingleThreaded(pixels, points);
-#else
-	MultiThreaded(pixels, points);
-#endif
+	SDL_Quit();
 
 	free(points);
 	free(pixels);
